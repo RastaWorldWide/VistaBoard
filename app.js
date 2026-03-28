@@ -28,7 +28,7 @@ const SYNC_POLL_MS = 12000;
 
 let state = loadState();
 let currentRoute = null;
-const ui = { search: "", selectedFrameByScene: {}, pendingVideoTarget: null, localVideoUrlsByFrameId: {}, videoModalFrameId: "" };
+const ui = { search: "", selectedFrameByScene: {}, pendingVideoTarget: null, localVideoUrlsByFrameId: {}, videoModalFrameId: "", collapsedFramesById: {} };
 const syncRuntime = { cfg: null, pushTimer: null, pollTimer: null, lastRemoteUpdatedAt: "", lastSyncAt: "", isPushing: false, isPulling: false, status: "off", lastError: "" };
 
 function uid(prefix = "id") {
@@ -552,7 +552,7 @@ function renderFrames(projectId) {
   return `
     <section class="page">
       ${renderTop(`${project.name} / Кадры`, { showBack: true, backTo: `#/project/${projectId}`, right: `<button class="btn" data-action="add-scene" data-project-id="${projectId}">+ Сцена</button>` })}
-      <div class="frames-layout"><section class="scene-list">${scenes.map((s) => { const videos = getFrames(projectId, s.id).length; return `<article class="scene-row"><div class="scene-preview">${renderScenePreview(projectId, s.id)}</div><div class="scene-main"><button class="scene-open" data-action="open-scene" data-project-id="${projectId}" data-scene-id="${s.id}">${escapeHtml(s.name)}</button><span class="scene-count">${videos} видео</span></div><input class="input scene-owner" data-bind="scene" data-field="owner" data-project-id="${projectId}" data-id="${s.id}" value="${escapeAttr(s.owner)}" /><button class="icon-btn" data-action="remove-scene" data-project-id="${projectId}" data-id="${s.id}">×</button></article>`; }).join("")}</section></div>
+      <div class="frames-layout"><section class="scene-list">${scenes.map((s) => { const videos = getFrames(projectId, s.id).length; return `<article class="scene-row"><div class="scene-preview">${renderScenePreview(projectId, s.id)}</div><div class="scene-main"><div class="scene-title-row"><button class="scene-open" data-action="open-scene" data-project-id="${projectId}" data-scene-id="${s.id}">${escapeHtml(s.name)}</button><button class="icon-btn scene-edit-btn" data-action="rename-scene" data-project-id="${projectId}" data-scene-id="${s.id}" title="Переименовать сцену">✎</button></div><span class="scene-count">${videos} видео</span></div><input class="input scene-owner" data-bind="scene" data-field="owner" data-project-id="${projectId}" data-id="${s.id}" value="${escapeAttr(s.owner)}" /><button class="icon-btn" data-action="remove-scene" data-project-id="${projectId}" data-id="${s.id}">×</button></article>`; }).join("")}</section></div>
     </section>
   `;
 }
@@ -598,7 +598,11 @@ function renderScene(projectId, sceneId, board = false) {
       })}
       <div class="frame-layout">
         <section class="frame-canvas ${board ? "board" : "list"}">
-          ${frames.length ? frames.map((frame) => renderFrameCard(frame, projectId, sceneId, selected)).join("") : `<div class="frame-empty full">Сцена пустая. Нажмите "+ Добавить видео".</div>`}
+          ${frames.length
+            ? board
+              ? frames.map((frame) => renderFrameCard(frame, projectId, sceneId, selected)).join("")
+              : renderFrameTree(frames, projectId, sceneId, selected)
+            : `<div class="frame-empty full">Сцена пустая. Нажмите "+ Добавить видео".</div>`}
         </section>
         ${renderFramePanel(projectId, sceneId, selectedFrame)}
       </div>
@@ -619,10 +623,7 @@ function frameSubtitle(frame, sceneId) {
   return sceneId;
 }
 
-function renderFrameCard(frame, projectId, sceneId, selected) {
-  const markHex = getFrameColorHex(frame.markColor);
-  const cls = `${frame.id === selected ? "selected" : ""} ${markHex ? "marked" : ""}`.trim();
-  const videoSrc = resolveFrameVideoSrc(frame);
+function frameStatusBadge(frame, videoSrc) {
   const uploadBadge = frame.uploadStatus === "uploading"
     ? `<span class="frame-upload-badge">Загрузка...</span>`
     : frame.uploadStatus === "error"
@@ -630,19 +631,82 @@ function renderFrameCard(frame, projectId, sceneId, selected) {
       : frame.uploadStatus === "local"
         ? `<span class="frame-upload-badge local">Локально</span>`
         : "";
+  return `${videoSrc ? `<span class="frame-badge">Video</span>` : ""}${uploadBadge}`;
+}
+
+function frameThumbMedia(frame) {
+  const videoSrc = resolveFrameVideoSrc(frame);
   const media = videoSrc
     ? `<video src="${escapeAttr(videoSrc)}" preload="metadata" muted playsinline></video>`
     : frame.image
       ? `<img src="${frame.image}" alt="${escapeAttr(frame.code)}"/>`
       : `<div class="frame-text">${escapeHtml(frame.text)}</div>`;
+  return { media, videoSrc };
+}
+
+function frameVersionCount(frames, frameId) {
+  return frames.filter((item) => item.parentId === frameId).length;
+}
+
+function renderFrameTree(frames, projectId, sceneId, selected) {
+  const roots = frames.filter((frame) => !frame.parentId);
+  const rows = roots.map((frame) => `<section class="frame-line-block">${renderFrameTreeNode(frame, frames, projectId, sceneId, selected, 0)}</section>`);
+  return `<div class="frame-tree">${rows.join("")}</div>`;
+}
+
+function renderFrameTreeNode(frame, frames, projectId, sceneId, selected, depth) {
+  const children = frames.filter((item) => item.parentId === frame.id);
+  const markHex = getFrameColorHex(frame.markColor);
+  const cls = `${frame.id === selected ? "selected" : ""} ${markHex ? "marked" : ""}`.trim();
+  const { media, videoSrc } = frameThumbMedia(frame);
+  const metaLabel = depth === 0 ? "Base" : `V${depth}`;
+  const isCollapsed = Boolean(ui.collapsedFramesById[frame.id]);
+  const childTree = children.length && !isCollapsed
+    ? `<div class="frame-children right">${children.map((child) => renderFrameTreeNode(child, frames, projectId, sceneId, selected, depth + 1)).join("")}</div>`
+    : "";
+  const toggle = children.length
+    ? `<button class="tree-toggle ${isCollapsed ? "collapsed" : ""}" data-action="toggle-frame-children" data-id="${frame.id}" title="${isCollapsed ? "Раскрыть версии" : "Скрыть версии"}">${isCollapsed ? "+" : "−"} <span>${children.length}</span></button>`
+    : `<span class="tree-toggle placeholder">0</span>`;
+
+  return `
+    <div class="frame-tree-node depth-${Math.min(depth, 3)}">
+      <div class="frame-tree-branch">
+        <article class="frame-row ${cls}" style="${markHex ? `--frame-mark-color:${markHex};` : ""}" data-action="select-frame" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">
+          <div class="frame-row-thumb">
+            <div class="frame-thumb compact">
+              ${media}
+              ${markHex ? `<span class="frame-color-dot" style="background:${markHex}"></span>` : ""}
+              ${frameStatusBadge(frame, videoSrc)}
+            </div>
+            <div class="frame-row-footer">
+              <div class="frame-row-head">
+                <strong>${escapeHtml(frame.code)}</strong>
+                <span class="frame-row-meta">${escapeHtml(metaLabel)}</span>
+              </div>
+              <div class="frame-row-actions">
+                ${toggle}
+                <button class="btn small ghost" data-action="add-version" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">+ Версия</button>
+              </div>
+            </div>
+          </div>
+        </article>
+        ${childTree}
+      </div>
+    </div>
+  `;
+}
+
+function renderFrameCard(frame, projectId, sceneId, selected) {
+  const markHex = getFrameColorHex(frame.markColor);
+  const cls = `${frame.id === selected ? "selected" : ""} ${markHex ? "marked" : ""}`.trim();
+  const { media, videoSrc } = frameThumbMedia(frame);
 
   return `
     <article class="frame-card ${cls}" style="${markHex ? `--frame-mark-color:${markHex};` : ""}" data-action="select-frame" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">
       <div class="frame-thumb">
         ${media}
         ${markHex ? `<span class="frame-color-dot" style="background:${markHex}"></span>` : ""}
-        ${videoSrc ? `<span class="frame-badge">Video</span>` : ""}
-        ${uploadBadge}
+        ${frameStatusBadge(frame, videoSrc)}
       </div>
       <div class="frame-caption">
         <strong>${escapeHtml(frame.code)}</strong>
@@ -657,6 +721,10 @@ function renderFramePanel(projectId, sceneId, frame) {
   const comments = state.commentsByFrameId[frame.id] || [];
   const videoSrc = resolveFrameVideoSrc(frame);
   const localHint = frame.localFileName && !frame.video ? `<p class="hint">Локальный файл: ${escapeHtml(frame.localFileName)}</p>` : "";
+  const scene = getScenes(projectId).find((item) => item.id === sceneId);
+  const frames = getFrames(projectId, sceneId);
+  const childrenCount = frameVersionCount(frames, frame.id);
+  const versionLabel = frame.parentId ? "Версия" : "Базовое видео";
   const uploadHint = frame.uploadStatus === "uploading"
     ? `<p class="hint">Идет загрузка в облако...</p>`
     : frame.uploadStatus === "local"
@@ -674,6 +742,14 @@ function renderFramePanel(projectId, sceneId, frame) {
   return `
     <aside class="side-panel">
       <h3>${escapeHtml(frame.code)}</h3>
+      <div class="video-info-grid">
+        <div><span class="field-label">Тип</span><p class="info-copy">${escapeHtml(versionLabel)}</p></div>
+        <div><span class="field-label">Сцена</span><p class="info-copy">${escapeHtml(scene?.name || sceneId)}</p></div>
+        <div><span class="field-label">Название</span><p class="info-copy">${escapeHtml(frame.text || "Без названия")}</p></div>
+        <div><span class="field-label">Источник</span><p class="info-copy">${escapeHtml(frameSubtitle(frame, sceneId))}</p></div>
+        <div><span class="field-label">Комментарии</span><p class="info-copy">${comments.length}</p></div>
+        <div><span class="field-label">Версии</span><p class="info-copy">${childrenCount}</p></div>
+      </div>
       ${videoSrc ? `<video class="video-player" src="${escapeAttr(videoSrc)}" controls playsinline></video>` : `<div class="video-placeholder">Видео не добавлено. Загрузите файл кнопкой сверху.</div>`}
       ${localHint}
       ${uploadHint}
@@ -1432,6 +1508,22 @@ function handleAction(actionEl) {
     return;
   }
 
+  if (action === "rename-scene") {
+    const projectId = actionEl.dataset.projectId;
+    const sceneId = actionEl.dataset.sceneId;
+    if (!projectId || !sceneId) return;
+    const scene = getScenes(projectId).find((item) => item.id === sceneId);
+    if (!scene) return;
+    const nextName = prompt("Новое название сцены:", scene.name || "");
+    if (nextName === null) return;
+    scene.name = String(nextName || "").trim() || scene.name || "Новая сцена";
+    const project = getProject(projectId);
+    if (project) project.updatedAt = nowISO();
+    saveState();
+    renderCurrentRoute();
+    return;
+  }
+
   if (action === "select-frame") {
     const projectId = actionEl.dataset.projectId;
     const sceneId = actionEl.dataset.sceneId;
@@ -1439,6 +1531,14 @@ function handleAction(actionEl) {
     if (!projectId || !sceneId || !id) return;
     ui.selectedFrameByScene[sceneKey(projectId, sceneId)] = id;
     ui.videoModalFrameId = "";
+    renderCurrentRoute();
+    return;
+  }
+
+  if (action === "toggle-frame-children") {
+    const id = actionEl.dataset.id;
+    if (!id) return;
+    ui.collapsedFramesById[id] = !ui.collapsedFramesById[id];
     renderCurrentRoute();
     return;
   }
@@ -1501,6 +1601,7 @@ function handleAction(actionEl) {
     const image = ver <= 3 ? `assets/frame-0050-v${ver}.svg` : "";
     const frameId = uid("f");
     frames.push({ id: frameId, code, sceneId, parentId: baseId, text: `Версия ${ver}`, image, markColor: "" });
+    delete ui.collapsedFramesById[baseId];
     ui.selectedFrameByScene[sceneKey(projectId, sceneId)] = frameId;
     addActivity(projectId, `Добавлена версия ${code}`);
     renderCurrentRoute();
