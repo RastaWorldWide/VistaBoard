@@ -25,11 +25,12 @@ const FRAME_COLOR_OPTIONS = [
 const SUPABASE_STORAGE_DEFAULT_BUCKET = "videos";
 const SYNC_CONFIG_KEY = "vistaboard_sync_config_v1";
 const SYNC_POLL_MS = 12000;
+const SYNC_CONFIG_ENDPOINT = "/api/sync-config";
 
 let state = loadState();
 let currentRoute = null;
-const ui = { search: "", selectedFrameByScene: {}, pendingVideoTarget: null, localVideoUrlsByFrameId: {}, videoModalFrameId: "", collapsedFramesById: {} };
-const syncRuntime = { cfg: null, pushTimer: null, pollTimer: null, lastRemoteUpdatedAt: "", lastSyncAt: "", isPushing: false, isPulling: false, status: "off", lastError: "" };
+const ui = { search: "", selectedFrameByScene: {}, pendingVideoTarget: null, localMediaUrlsByFrameId: {}, videoModalFrameId: "", collapsedFramesById: {} };
+const syncRuntime = { cfg: null, configSource: "none", pushTimer: null, pollTimer: null, lastRemoteUpdatedAt: "", lastSyncAt: "", isPushing: false, isPulling: false, status: "off", lastError: "" };
 
 function uid(prefix = "id") {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
@@ -168,18 +169,22 @@ function saveState(options = {}) {
   if (!skipRemote) scheduleRemotePush();
 }
 
+function normalizeSyncConfig(input, fallback = {}) {
+  const parsed = input || {};
+  return {
+    supabaseUrl: normalizeSupabaseUrl(String(parsed.supabaseUrl || fallback.supabaseUrl || "").trim()),
+    anonKey: normalizeSupabaseApiKey(String(parsed.anonKey || fallback.anonKey || "")),
+    workspaceId: String(parsed.workspaceId || fallback.workspaceId || "default").trim() || "default",
+    deviceName: String(parsed.deviceName || fallback.deviceName || "web-client").trim() || "web-client",
+    storageBucket: String(parsed.storageBucket || fallback.storageBucket || SUPABASE_STORAGE_DEFAULT_BUCKET).trim() || SUPABASE_STORAGE_DEFAULT_BUCKET,
+  };
+}
+
 function loadSyncConfig() {
   try {
     const raw = localStorage.getItem(SYNC_CONFIG_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return {
-      supabaseUrl: normalizeSupabaseUrl(String(parsed.supabaseUrl || "").trim()),
-      anonKey: normalizeSupabaseApiKey(String(parsed.anonKey || "")),
-      workspaceId: String(parsed.workspaceId || "default").trim() || "default",
-      deviceName: String(parsed.deviceName || "web-client").trim() || "web-client",
-      storageBucket: String(parsed.storageBucket || SUPABASE_STORAGE_DEFAULT_BUCKET).trim() || SUPABASE_STORAGE_DEFAULT_BUCKET,
-    };
+    return normalizeSyncConfig(JSON.parse(raw));
   } catch (_e) {
     return null;
   }
@@ -198,6 +203,21 @@ function saveSyncConfig(cfg) {
 function isSyncConfigured() {
   const cfg = syncRuntime.cfg;
   return Boolean(cfg?.supabaseUrl && cfg?.anonKey && cfg?.workspaceId);
+}
+
+async function fetchBootstrapSyncConfig() {
+  if (typeof window === "undefined") return null;
+  if (!window.location || !/^https?:$/i.test(window.location.protocol)) return null;
+  try {
+    const resp = await fetch(`${SYNC_CONFIG_ENDPOINT}?t=${Date.now()}`, { cache: "no-store" });
+    if (!resp.ok) return null;
+    const payload = await resp.json().catch(() => null);
+    if (!payload?.configured || !payload?.sync) return null;
+    const existing = loadSyncConfig() || {};
+    return normalizeSyncConfig(payload.sync, { deviceName: existing.deviceName || "web-client" });
+  } catch (_e) {
+    return null;
+  }
 }
 
 function syncHeaders(cfg, includeContentType = false, includePrefer = false) {
@@ -322,11 +342,12 @@ function syncStatusLine() {
   if (syncRuntime.status === "error") return `Командный sync: ошибка (${syncRuntime.lastError || "неизвестно"})`;
   if (syncRuntime.status === "syncing") return "Командный sync: синхронизация...";
   const suffix = syncRuntime.lastSyncAt ? ` • обновлено ${formatRelative(syncRuntime.lastSyncAt)}` : "";
-  return `Командный sync: онлайн${suffix}`;
+  const source = syncRuntime.configSource === "remote" ? "авто" : "ручной";
+  return `Командный sync: онлайн (${source})${suffix}`;
 }
 
 async function connectSync() {
-  syncRuntime.cfg = loadSyncConfig();
+  syncRuntime.cfg = syncRuntime.cfg || loadSyncConfig();
   if (!isSyncConfigured()) {
     syncRuntime.status = "off";
     syncRuntime.lastError = "";
@@ -337,6 +358,22 @@ async function connectSync() {
   const pulled = await pullRemoteState({ apply: true });
   if (!pulled.found) await pushRemoteState("init");
   startSyncPolling();
+}
+
+async function bootstrapSyncConfig() {
+  const localCfg = loadSyncConfig();
+  const remoteCfg = await fetchBootstrapSyncConfig();
+
+  if (remoteCfg) {
+    saveSyncConfig(remoteCfg);
+    syncRuntime.cfg = remoteCfg;
+    syncRuntime.configSource = "remote";
+    return remoteCfg;
+  }
+
+  syncRuntime.cfg = localCfg;
+  syncRuntime.configSource = localCfg ? "local" : "none";
+  return localCfg;
 }
 
 function addActivity(projectId, text, type = "update") {
@@ -462,7 +499,7 @@ function renderHome() {
 
   return `
     <section class="page">
-      ${renderTop("", { right: `<button class="btn ghost small" data-action="configure-sync">Командный sync</button><button class="btn ghost small" data-action="sync-now">Синхр. сейчас</button><button class="btn ghost small" data-action="export">Экспорт</button><button class="btn ghost small" data-action="import">Импорт</button>` })}
+      ${renderTop("", { right: `${syncRuntime.configSource === "remote" ? "" : `<button class="btn ghost small" data-action="configure-sync">Командный sync</button>`}<button class="btn ghost small" data-action="sync-now">Синхр. сейчас</button><button class="btn ghost small" data-action="export">Экспорт</button><button class="btn ghost small" data-action="import">Импорт</button>` })}
       <div class="home-controls">
         <label class="search"><span>Поиск</span><input data-search value="${escapeAttr(ui.search)}" placeholder="Проект, клиент" /></label>
         <div class="actions"><button class="btn" data-action="new-project">+ Новый проект</button><button class="btn" data-action="new-folder">+ Новая папка</button></div>
@@ -559,17 +596,18 @@ function renderFrames(projectId) {
 
 function renderScenePreview(projectId, sceneId) {
   const frames = getFrames(projectId, sceneId).slice(0, 3);
-  if (!frames.length) return `<div class="scene-preview-empty">Нет видео</div>`;
+  if (!frames.length) return `<div class="scene-preview-empty">Нет медиа</div>`;
 
   return `
     <div class="scene-preview-grid">
       ${frames.map((frame, idx) => {
-        const src = resolveFrameVideoSrc(frame);
+        const src = resolveFrameMediaSrc(frame);
+        const kind = frameMediaKind(frame);
         const media = src
-          ? `<video src="${escapeAttr(src)}" muted playsinline preload="metadata"></video>`
-          : frame.image
-            ? `<img src="${escapeAttr(frame.image)}" alt="${escapeAttr(frame.code)}" />`
-            : `<div class="scene-preview-fallback">${escapeHtml(frame.code)}</div>`;
+          ? kind === "image"
+            ? `<img src="${escapeAttr(src)}" alt="${escapeAttr(frame.code)}" />`
+            : `<video src="${escapeAttr(src)}" muted playsinline preload="metadata"></video>`
+          : `<div class="scene-preview-fallback">${escapeHtml(frame.code)}</div>`;
         return `<div class="scene-preview-tile s-tile-${idx + 1}">${media}</div>`;
       }).join("")}
     </div>
@@ -594,7 +632,7 @@ function renderScene(projectId, sceneId, board = false) {
         showBack: true,
         backTo: `#/project/${projectId}/frames`,
         listTo: board ? `#/project/${projectId}/frames/${sceneId}` : `#/project/${projectId}/frames/${sceneId}/board`,
-        right: `<button class="btn" data-action="add-video" data-project-id="${projectId}" data-scene-id="${sceneId}">+ Добавить видео</button>`,
+        right: `<button class="btn" data-action="add-video" data-project-id="${projectId}" data-scene-id="${sceneId}">+ Новая линия</button>`,
       })}
       <div class="frame-layout">
         <section class="frame-canvas ${board ? "board" : "list"}">
@@ -602,7 +640,7 @@ function renderScene(projectId, sceneId, board = false) {
             ? board
               ? frames.map((frame) => renderFrameCard(frame, projectId, sceneId, selected)).join("")
               : renderFrameTree(frames, projectId, sceneId, selected)
-            : `<div class="frame-empty full">Сцена пустая. Нажмите "+ Добавить видео".</div>`}
+            : `<div class="frame-empty full">Сцена пустая. Нажмите "+ Новая линия".</div>`}
         </section>
         ${renderFramePanel(projectId, sceneId, selectedFrame)}
       </div>
@@ -611,10 +649,24 @@ function renderScene(projectId, sceneId, board = false) {
   `;
 }
 
-function resolveFrameVideoSrc(frame) {
+function frameMediaKind(frame) {
   if (!frame) return "";
-  if (frame.video) return frame.video;
-  return ui.localVideoUrlsByFrameId[frame.id] || "";
+  if (frame.mediaKind === "image" || frame.mediaKind === "video") return frame.mediaKind;
+  if (frame.video) return "video";
+  if (frame.image) return "image";
+  const name = String(frame.localFileName || "").toLowerCase();
+  if (/\.(png|jpe?g|webp|gif|bmp|svg)$/.test(name)) return "image";
+  if (/\.(mp4|webm|mov|m4v|avi|mkv)$/.test(name)) return "video";
+  return "";
+}
+
+function resolveFrameMediaSrc(frame) {
+  if (!frame) return "";
+  const localSrc = ui.localMediaUrlsByFrameId[frame.id] || "";
+  const kind = frameMediaKind(frame);
+  if (kind === "image") return frame.image || localSrc;
+  if (kind === "video") return frame.video || localSrc;
+  return localSrc || frame.video || frame.image || "";
 }
 
 function frameSubtitle(frame, sceneId) {
@@ -623,7 +675,7 @@ function frameSubtitle(frame, sceneId) {
   return sceneId;
 }
 
-function frameStatusBadge(frame, videoSrc) {
+function frameStatusBadge(frame, mediaSrc) {
   const uploadBadge = frame.uploadStatus === "uploading"
     ? `<span class="frame-upload-badge">Загрузка...</span>`
     : frame.uploadStatus === "error"
@@ -631,21 +683,38 @@ function frameStatusBadge(frame, videoSrc) {
       : frame.uploadStatus === "local"
         ? `<span class="frame-upload-badge local">Локально</span>`
         : "";
-  return `${videoSrc ? `<span class="frame-badge">Video</span>` : ""}${uploadBadge}`;
+  const kind = frameMediaKind(frame);
+  const kindBadge = mediaSrc && kind ? `<span class="frame-badge">${kind === "image" ? "Image" : "Video"}</span>` : "";
+  return `${kindBadge}${uploadBadge}`;
 }
 
 function frameThumbMedia(frame) {
-  const videoSrc = resolveFrameVideoSrc(frame);
-  const media = videoSrc
-    ? `<video src="${escapeAttr(videoSrc)}" preload="metadata" muted playsinline></video>`
-    : frame.image
-      ? `<img src="${frame.image}" alt="${escapeAttr(frame.code)}"/>`
-      : `<div class="frame-text">${escapeHtml(frame.text)}</div>`;
-  return { media, videoSrc };
+  const mediaSrc = resolveFrameMediaSrc(frame);
+  const kind = frameMediaKind(frame);
+  const media = mediaSrc
+    ? kind === "image"
+      ? `<img src="${escapeAttr(mediaSrc)}" alt="${escapeAttr(frame.code)}"/>`
+      : `<video src="${escapeAttr(mediaSrc)}" preload="metadata" muted playsinline></video>`
+    : `<div class="frame-text">${escapeHtml(frame.text)}</div>`;
+  return { media, mediaSrc, kind };
 }
 
 function frameVersionCount(frames, frameId) {
   return frames.filter((item) => item.parentId === frameId).length;
+}
+
+function nextRootFrameCode(frames) {
+  const maxBase = frames.reduce((acc, frame) => {
+    const match = String(frame.code || "").match(/^(\d+)/);
+    const num = match ? Number(match[1]) : 0;
+    return Number.isFinite(num) ? Math.max(acc, num) : acc;
+  }, 0);
+  return String(maxBase + 1).padStart(4, "0");
+}
+
+function nextChildFrameCode(frames, parentFrame) {
+  const siblings = frames.filter((item) => item.parentId === parentFrame.id);
+  return `${parentFrame.code}_V${siblings.length + 1}`;
 }
 
 function renderFrameTree(frames, projectId, sceneId, selected) {
@@ -658,7 +727,7 @@ function renderFrameTreeNode(frame, frames, projectId, sceneId, selected, depth)
   const children = frames.filter((item) => item.parentId === frame.id);
   const markHex = getFrameColorHex(frame.markColor);
   const cls = `${frame.id === selected ? "selected" : ""} ${markHex ? "marked" : ""}`.trim();
-  const { media, videoSrc } = frameThumbMedia(frame);
+  const { media, mediaSrc } = frameThumbMedia(frame);
   const metaLabel = depth === 0 ? "Base" : `V${depth}`;
   const isCollapsed = Boolean(ui.collapsedFramesById[frame.id]);
   const childTree = children.length && !isCollapsed
@@ -676,7 +745,7 @@ function renderFrameTreeNode(frame, frames, projectId, sceneId, selected, depth)
             <div class="frame-thumb compact">
               ${media}
               ${markHex ? `<span class="frame-color-dot" style="background:${markHex}"></span>` : ""}
-              ${frameStatusBadge(frame, videoSrc)}
+              ${frameStatusBadge(frame, mediaSrc)}
             </div>
             <div class="frame-row-footer">
               <div class="frame-row-head">
@@ -699,14 +768,14 @@ function renderFrameTreeNode(frame, frames, projectId, sceneId, selected, depth)
 function renderFrameCard(frame, projectId, sceneId, selected) {
   const markHex = getFrameColorHex(frame.markColor);
   const cls = `${frame.id === selected ? "selected" : ""} ${markHex ? "marked" : ""}`.trim();
-  const { media, videoSrc } = frameThumbMedia(frame);
+  const { media, mediaSrc } = frameThumbMedia(frame);
 
   return `
     <article class="frame-card ${cls}" style="${markHex ? `--frame-mark-color:${markHex};` : ""}" data-action="select-frame" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">
       <div class="frame-thumb">
         ${media}
         ${markHex ? `<span class="frame-color-dot" style="background:${markHex}"></span>` : ""}
-        ${frameStatusBadge(frame, videoSrc)}
+        ${frameStatusBadge(frame, mediaSrc)}
       </div>
       <div class="frame-caption">
         <strong>${escapeHtml(frame.code)}</strong>
@@ -717,18 +786,19 @@ function renderFrameCard(frame, projectId, sceneId, selected) {
 }
 
 function renderFramePanel(projectId, sceneId, frame) {
-  if (!frame) return `<aside class="side-panel"><p class="empty">Нет видео в сцене. Добавьте первое видео.</p></aside>`;
+  if (!frame) return `<aside class="side-panel"><p class="empty">Нет медиа в сцене. Добавьте первую линию.</p></aside>`;
   const comments = state.commentsByFrameId[frame.id] || [];
-  const videoSrc = resolveFrameVideoSrc(frame);
-  const localHint = frame.localFileName && !frame.video ? `<p class="hint">Локальный файл: ${escapeHtml(frame.localFileName)}</p>` : "";
+  const mediaSrc = resolveFrameMediaSrc(frame);
+  const mediaKind = frameMediaKind(frame);
+  const localHint = frame.localFileName && !(frame.video || frame.image) ? `<p class="hint">Локальный файл: ${escapeHtml(frame.localFileName)}</p>` : "";
   const scene = getScenes(projectId).find((item) => item.id === sceneId);
   const frames = getFrames(projectId, sceneId);
   const childrenCount = frameVersionCount(frames, frame.id);
-  const versionLabel = frame.parentId ? "Версия" : "Базовое видео";
+  const versionLabel = frame.parentId ? "Версия" : "Базовое медиа";
   const uploadHint = frame.uploadStatus === "uploading"
     ? `<p class="hint">Идет загрузка в облако...</p>`
     : frame.uploadStatus === "local"
-      ? `<p class="hint">Видео сохранено локально. Чтобы хранить в облаке, настройте Supabase Storage через Командный sync.</p>`
+      ? `<p class="hint">Медиа сохранено локально. Чтобы хранить его в облаке, настройте Supabase Storage через Командный sync.</p>`
       : frame.uploadStatus === "error"
         ? `<p class="hint error">Ошибка загрузки: ${escapeHtml(frame.uploadError || "неизвестно")}</p>`
       : "";
@@ -744,19 +814,25 @@ function renderFramePanel(projectId, sceneId, frame) {
       <h3>${escapeHtml(frame.code)}</h3>
       <div class="video-info-grid">
         <div><span class="field-label">Тип</span><p class="info-copy">${escapeHtml(versionLabel)}</p></div>
+        <div><span class="field-label">Медиа</span><p class="info-copy">${escapeHtml(mediaKind === "image" ? "Картинка" : mediaKind === "video" ? "Видео" : "Не задано")}</p></div>
         <div><span class="field-label">Сцена</span><p class="info-copy">${escapeHtml(scene?.name || sceneId)}</p></div>
         <div><span class="field-label">Название</span><p class="info-copy">${escapeHtml(frame.text || "Без названия")}</p></div>
         <div><span class="field-label">Источник</span><p class="info-copy">${escapeHtml(frameSubtitle(frame, sceneId))}</p></div>
         <div><span class="field-label">Комментарии</span><p class="info-copy">${comments.length}</p></div>
         <div><span class="field-label">Версии</span><p class="info-copy">${childrenCount}</p></div>
       </div>
-      ${videoSrc ? `<video class="video-player" src="${escapeAttr(videoSrc)}" controls playsinline></video>` : `<div class="video-placeholder">Видео не добавлено. Загрузите файл кнопкой сверху.</div>`}
+      <button class="btn small ghost" data-action="add-version" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">+ Добавить версию в эту ветку</button>
+      ${mediaSrc
+        ? mediaKind === "image"
+          ? `<img class="image-player" src="${escapeAttr(mediaSrc)}" alt="${escapeAttr(frame.code)}" />`
+          : `<video class="video-player" src="${escapeAttr(mediaSrc)}" controls playsinline></video>`
+        : `<div class="video-placeholder">Медиа не добавлено. Загрузите файл кнопкой сверху.</div>`}
       ${localHint}
       ${uploadHint}
       <label class="field-label">Цвет кадра</label>
       ${colorControls}
-      ${videoSrc ? `<button class="btn small" data-action="open-video-modal" data-id="${frame.id}">Большой просмотр</button>` : ""}
-      <button class="btn small danger" data-action="remove-video" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">Удалить видео</button>
+      ${mediaSrc ? `<button class="btn small" data-action="open-video-modal" data-id="${frame.id}">Большой просмотр</button>` : ""}
+      <button class="btn small danger" data-action="remove-video" data-project-id="${projectId}" data-scene-id="${sceneId}" data-id="${frame.id}">Удалить медиа</button>
       <div class="comment-block">
         <h4>Комментарии</h4>
         <div class="comment-list">${comments.length ? comments.map((c) => `<div class="comment-item">${escapeHtml(c)}</div>`).join("") : `<div class="comment-item">Комментариев нет</div>`}</div>
@@ -771,8 +847,9 @@ function renderFramePanel(projectId, sceneId, frame) {
 
 function renderVideoModal(projectId, sceneId, frame) {
   if (!frame || ui.videoModalFrameId !== frame.id) return "";
-  const videoSrc = resolveFrameVideoSrc(frame);
-  if (!videoSrc) return "";
+  const mediaSrc = resolveFrameMediaSrc(frame);
+  const mediaKind = frameMediaKind(frame);
+  if (!mediaSrc) return "";
 
   return `
     <div class="video-modal">
@@ -782,39 +859,47 @@ function renderVideoModal(projectId, sceneId, frame) {
           <strong>${escapeHtml(frame.code)} / ${escapeHtml(sceneId)}</strong>
           <button class="icon-btn" data-action="close-video-modal">×</button>
         </header>
-        <video class="video-modal-player" src="${escapeAttr(videoSrc)}" controls autoplay playsinline></video>
+        ${mediaKind === "image"
+          ? `<img class="video-modal-image" src="${escapeAttr(mediaSrc)}" alt="${escapeAttr(frame.code)}" />`
+          : `<video class="video-modal-player" src="${escapeAttr(mediaSrc)}" controls autoplay playsinline></video>`}
       </div>
     </div>
   `;
 }
 
-async function addVideoToScene(projectId, sceneId, file) {
+async function addVideoToScene(projectId, sceneId, file, options = {}) {
   if (!projectId || !sceneId || !file) return;
-  if (!String(file.type || "").startsWith("video/")) {
-    alert("Нужен видео-файл (video/*).");
+  const fileType = String(file.type || "");
+  const mediaKind = fileType.startsWith("image/") ? "image" : fileType.startsWith("video/") ? "video" : "";
+  if (!mediaKind) {
+    alert("Нужен файл картинки или видео.");
     return;
   }
 
   const frames = getFrames(projectId, sceneId);
+  const parentId = options.parentId || null;
+  const parentFrame = parentId ? frames.find((item) => item.id === parentId) : null;
   const frameId = uid("f");
-  const code = String(frames.length + 1).padStart(4, "0");
+  const code = parentFrame ? nextChildFrameCode(frames, parentFrame) : nextRootFrameCode(frames);
   const fileName = file.name || `video-${code}`;
   const text = fileName.replace(/\.[^/.]+$/, "");
 
-  ui.localVideoUrlsByFrameId[frameId] = URL.createObjectURL(file);
+  ui.localMediaUrlsByFrameId[frameId] = URL.createObjectURL(file);
   frames.push({
     id: frameId,
     code,
     sceneId,
-    parentId: null,
+    parentId,
     text,
-    image: "",
-    video: "",
+    image: mediaKind === "image" ? "" : "",
+    video: mediaKind === "video" ? "" : "",
+    mediaKind,
     markColor: "",
     uploadStatus: "uploading",
     uploadError: "",
     localFileName: fileName,
   });
+  if (parentId) delete ui.collapsedFramesById[parentId];
   ui.selectedFrameByScene[sceneKey(projectId, sceneId)] = frameId;
   saveState();
   renderCurrentRoute();
@@ -824,7 +909,7 @@ async function addVideoToScene(projectId, sceneId, file) {
     if (!frame) return;
     frame.uploadStatus = "local";
     frame.uploadError = "";
-    addActivity(projectId, `Видео ${fileName} добавлено локально (Supabase Storage не настроен)`, "info");
+    addActivity(projectId, parentFrame ? `Версия ${code} добавлена локально` : `${mediaKind === "image" ? "Картинка" : "Видео"} ${fileName} добавлено локально (Supabase Storage не настроен)`, "info");
     saveState();
     renderCurrentRoute();
     return;
@@ -834,14 +919,15 @@ async function addVideoToScene(projectId, sceneId, file) {
     const remoteUrl = await uploadVideoToSupabase(file, projectId, sceneId, code);
     const frame = getFrames(projectId, sceneId).find((x) => x.id === frameId);
     if (!frame) return;
-    frame.video = remoteUrl;
+    if (mediaKind === "image") frame.image = remoteUrl;
+    else frame.video = remoteUrl;
     frame.uploadStatus = "ready";
     frame.uploadError = "";
-    if (ui.localVideoUrlsByFrameId[frameId]) {
-      URL.revokeObjectURL(ui.localVideoUrlsByFrameId[frameId]);
-      delete ui.localVideoUrlsByFrameId[frameId];
+    if (ui.localMediaUrlsByFrameId[frameId]) {
+      URL.revokeObjectURL(ui.localMediaUrlsByFrameId[frameId]);
+      delete ui.localMediaUrlsByFrameId[frameId];
     }
-    addActivity(projectId, `Видео ${fileName} загружено в облако`);
+    addActivity(projectId, parentFrame ? `Версия ${code} загружена в облако` : `${mediaKind === "image" ? "Картинка" : "Видео"} ${fileName} загружено в облако`);
   } catch (error) {
     const frame = getFrames(projectId, sceneId).find((x) => x.id === frameId);
     if (!frame) return;
@@ -884,10 +970,10 @@ function removeFrameFromScene(projectId, sceneId, frameId) {
   if (!toDelete.size) return false;
 
   for (const id of toDelete) {
-    const url = ui.localVideoUrlsByFrameId[id];
+    const url = ui.localMediaUrlsByFrameId[id];
     if (url) {
       URL.revokeObjectURL(url);
-      delete ui.localVideoUrlsByFrameId[id];
+      delete ui.localMediaUrlsByFrameId[id];
     }
     delete state.commentsByFrameId[id];
     delete state.frameNotesById[id];
@@ -905,10 +991,10 @@ function removeFrameFromScene(projectId, sceneId, frameId) {
 function disposeSceneVideos(projectId, sceneId) {
   const frames = getFrames(projectId, sceneId);
   for (const frame of frames) {
-    const url = ui.localVideoUrlsByFrameId[frame.id];
+    const url = ui.localMediaUrlsByFrameId[frame.id];
     if (url) {
       URL.revokeObjectURL(url);
-      delete ui.localVideoUrlsByFrameId[frame.id];
+      delete ui.localMediaUrlsByFrameId[frame.id];
     }
   }
 }
@@ -922,10 +1008,10 @@ function removeProjectData(projectId) {
     const key = sceneKey(projectId, scene.id);
     const frames = state.framesBySceneId[key] || [];
     for (const frame of frames) {
-      const url = ui.localVideoUrlsByFrameId[frame.id];
+      const url = ui.localMediaUrlsByFrameId[frame.id];
       if (url) {
         URL.revokeObjectURL(url);
-        delete ui.localVideoUrlsByFrameId[frame.id];
+        delete ui.localMediaUrlsByFrameId[frame.id];
       }
       delete state.commentsByFrameId[frame.id];
       delete state.frameNotesById[frame.id];
@@ -1171,15 +1257,16 @@ function renderModulePreview(projectId, moduleKey) {
     return `
       <div class="module-preview frames-preview">
         ${items.length ? items.map((f, idx) => {
-          const src = resolveFrameVideoSrc(f);
+          const src = resolveFrameMediaSrc(f);
+          const kind = frameMediaKind(f);
           const media = src
-            ? `<video src="${escapeAttr(src)}" muted playsinline preload="metadata"></video>`
-            : f.image
-              ? `<img src="${escapeAttr(f.image)}" alt="${escapeAttr(f.code)}" />`
-              : `<div class="mini-frame-fallback">${escapeHtml(f.code)}</div>`;
+            ? kind === "image"
+              ? `<img src="${escapeAttr(src)}" alt="${escapeAttr(f.code)}" />`
+              : `<video src="${escapeAttr(src)}" muted playsinline preload="metadata"></video>`
+            : `<div class="mini-frame-fallback">${escapeHtml(f.code)}</div>`;
           return `<div class="mini-frame-tile tile-${idx + 1}">${media}</div>`;
         }).join("") : `<div class="mini-preview-empty">Нет кадров</div>`}
-        <div class="mini-frames-meta">${items.length} видео</div>
+        <div class="mini-frames-meta">${items.length} медиа</div>
       </div>
     `;
   }
@@ -1547,7 +1634,7 @@ function handleAction(actionEl) {
     const projectId = actionEl.dataset.projectId;
     const sceneId = actionEl.dataset.sceneId;
     if (!projectId || !sceneId) return;
-    ui.pendingVideoTarget = { projectId, sceneId };
+    ui.pendingVideoTarget = { projectId, sceneId, parentId: null };
     const input = document.getElementById("videoUploadInput");
     if (input) input.click();
     return;
@@ -1592,19 +1679,9 @@ function handleAction(actionEl) {
     const sceneId = actionEl.dataset.sceneId;
     const baseId = actionEl.dataset.id;
     if (!projectId || !sceneId || !baseId) return;
-    const frames = getFrames(projectId, sceneId);
-    const base = frames.find((x) => x.id === baseId);
-    if (!base) return;
-    const siblings = frames.filter((x) => x.parentId === baseId);
-    const ver = siblings.length + 1;
-    const code = `${base.code}_V${ver}`;
-    const image = ver <= 3 ? `assets/frame-0050-v${ver}.svg` : "";
-    const frameId = uid("f");
-    frames.push({ id: frameId, code, sceneId, parentId: baseId, text: `Версия ${ver}`, image, markColor: "" });
-    delete ui.collapsedFramesById[baseId];
-    ui.selectedFrameByScene[sceneKey(projectId, sceneId)] = frameId;
-    addActivity(projectId, `Добавлена версия ${code}`);
-    renderCurrentRoute();
+    ui.pendingVideoTarget = { projectId, sceneId, parentId: baseId };
+    const input = document.getElementById("videoUploadInput");
+    if (input) input.click();
     return;
   }
 
@@ -1786,7 +1863,7 @@ function bindGlobalEvents() {
       if (!(target instanceof HTMLInputElement)) return;
       const file = target.files?.[0] || null;
       const pending = ui.pendingVideoTarget;
-      if (file && pending) await addVideoToScene(pending.projectId, pending.sceneId, file);
+      if (file && pending) await addVideoToScene(pending.projectId, pending.sceneId, file, { parentId: pending.parentId || null });
       ui.pendingVideoTarget = null;
       target.value = "";
     });
@@ -1795,9 +1872,9 @@ function bindGlobalEvents() {
   window.addEventListener("hashchange", renderCurrentRoute);
 }
 
-function initApp() {
+async function initApp() {
   bindGlobalEvents();
-  syncRuntime.cfg = loadSyncConfig();
+  await bootstrapSyncConfig();
   if (isSyncConfigured()) connectSync().then(() => renderCurrentRoute());
   if (!window.location.hash) {
     navigate("#/home");
